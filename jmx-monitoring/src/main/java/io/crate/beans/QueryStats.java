@@ -18,187 +18,159 @@
 
 package io.crate.beans;
 
-import com.google.common.annotations.VisibleForTesting;
-import io.crate.action.sql.Option;
-import io.crate.action.sql.ResultReceiver;
-import io.crate.action.sql.SQLOperations;
-import io.crate.data.Row;
-import io.crate.exceptions.SQLExceptions;
-import org.apache.logging.log4j.Logger;
-import org.elasticsearch.common.logging.Loggers;
-import org.elasticsearch.common.lucene.BytesRefs;
-import org.elasticsearch.common.settings.Settings;
+import com.google.common.base.Supplier;
+import com.google.common.base.Suppliers;
+import io.crate.operation.collect.stats.JobsLogs;
+import io.crate.operation.reference.sys.job.JobContextLog;
 
-import javax.annotation.Nonnull;
-import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
+import java.util.HashMap;
+import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
-import static io.crate.action.sql.SQLOperations.Session.UNNAMED;
-import static io.crate.beans.QueryStats.MetricType.AVERAGE_DURATION;
-import static io.crate.beans.QueryStats.MetricType.FREQUENCY;
 
 public class QueryStats implements QueryStatsMBean {
 
-    private final Logger logger;
+    static class Commands {
+        static final String TOTAL = "total";
+        static final String UNCLASSIFIED = "unclassified";
 
-    enum MetricType {
-        FREQUENCY,
-        AVERAGE_DURATION
+        static final String SELECT = "select";
+        static final String INSERT = "insert";
+        static final String UPDATE = "update";
+        static final String DELETE = "delete";
+    }
+
+    static class Metric {
+
+        private final double elapsedSinceUpdateInSec;
+
+        private long count;
+        private long sumOfDurations;
+
+        Metric(long duration, double elapsedSinceUpdateInSec) {
+            this.elapsedSinceUpdateInSec = elapsedSinceUpdateInSec;
+            sumOfDurations = duration;
+            count = 1;
+        }
+
+        void inc(long duration) {
+            sumOfDurations += duration;
+            count++;
+        }
+
+        double statementsPerSec() {
+            return count / elapsedSinceUpdateInSec;
+        }
+
+        double avgDurationInMs() {
+            return sumOfDurations / count;
+        }
     }
 
     public static final String NAME = "io.crate.monitoring:type=QueryStats";
+    private static final Pattern COMMAND_PATTERN = Pattern.compile("^\\s*(select|insert|update|delete).*");
+    private static final Metric DEFAULT_METRIC = new Metric(0, 1);
 
-    private static final String QUERY_PATTERN = "^\\s*(%s).*";
-    private static final String STMT = "SELECT COUNT(*) / ((CURRENT_TIMESTAMP - ?) / 1000.0), " +
-        "AVG(ended - started), REGEXP_MATCHES(LOWER(stmt), ?)[1] " +
-        "FROM sys.jobs_log " +
-        "WHERE started BETWEEN ? AND CURRENT_TIMESTAMP " +
-        "  AND REGEXP_MATCHES(LOWER(stmt), ?)[1] IS NOT NULL " +
-        "GROUP BY 3";
+    private final Supplier<Map<String, Metric>> metricByCommand;
 
-    private final ConcurrentMap<String, Double> metrics;
-    private final SQLOperations.Session session;
-    @VisibleForTesting
-    final ConcurrentMap<String, Long> lastQueried;
+    private volatile long lastUpdateTsInMillis = System.currentTimeMillis();
 
-    public QueryStats(SQLOperations sqlOperations, Settings settings) {
-        logger = Loggers.getLogger(QueryStats.class, settings);
-        session = sqlOperations.createSession("sys", null, Option.NONE, 10000);
-        session.parse(NAME, STMT, Collections.emptyList());
+    public QueryStats(JobsLogs jobsLogs) {
+        metricByCommand = Suppliers.memoizeWithExpiration(
+            () -> {
+                long currentTs = System.currentTimeMillis();
+                Map<String, Metric> metricByCommand = createMetricsMap(jobsLogs.jobsLog(), currentTs, lastUpdateTsInMillis);
+                lastUpdateTsInMillis = currentTs;
+                return metricByCommand;
+            },
+            1,
+            TimeUnit.SECONDS
+        );
+    }
 
-        lastQueried = new ConcurrentHashMap<>();
-        metrics = new ConcurrentHashMap<>();
+    static Map<String, Metric> createMetricsMap(Iterable<JobContextLog> logEntries, long currentTs, long lastUpdateTs) {
+        Map<String, Metric> metricsByCommand = new HashMap<>();
+        double elapsedSinceLastUpdateInSec = (currentTs - lastUpdateTs) / 1000.0;
+
+        Metric total = new Metric(0, elapsedSinceLastUpdateInSec);
+        for (JobContextLog logEntry : logEntries) {
+            if (logEntry.started() < lastUpdateTs || logEntry.started() > currentTs) {
+                continue;
+            }
+            String command = getCommand(logEntry.statement());
+            long duration = logEntry.ended() - logEntry.started();
+            total.inc(duration);
+            metricsByCommand.compute(command, (key, oldMetric) -> {
+                if (oldMetric == null) {
+                    return new Metric(duration, elapsedSinceLastUpdateInSec);
+                }
+                oldMetric.inc(duration);
+                return oldMetric;
+            });
+        }
+        metricsByCommand.put(Commands.TOTAL, total);
+        return metricsByCommand;
+    }
+
+    private static String getCommand(String statement) {
+        Matcher matcher = COMMAND_PATTERN.matcher(statement.toLowerCase(Locale.ENGLISH));
+        if (matcher.find()) {
+            return matcher.group(1);
+        } else {
+            return Commands.UNCLASSIFIED;
+        }
     }
 
     @Override
     public double getSelectQueryFrequency() {
-        return updateAndGetLastSingleMetricValue("select", FREQUENCY);
+        return metricByCommand.get().getOrDefault(Commands.SELECT, DEFAULT_METRIC).statementsPerSec();
     }
 
     @Override
     public double getInsertQueryFrequency() {
-        return updateAndGetLastSingleMetricValue("insert", FREQUENCY);
+        return metricByCommand.get().getOrDefault(Commands.INSERT, DEFAULT_METRIC).statementsPerSec();
     }
 
     @Override
     public double getUpdateQueryFrequency() {
-        return updateAndGetLastSingleMetricValue("update", FREQUENCY);
+        return metricByCommand.get().getOrDefault(Commands.UPDATE, DEFAULT_METRIC).statementsPerSec();
     }
 
     @Override
     public double getDeleteQueryFrequency() {
-        return updateAndGetLastSingleMetricValue("delete", FREQUENCY);
+        return metricByCommand.get().getOrDefault(Commands.DELETE, DEFAULT_METRIC).statementsPerSec();
     }
 
     @Override
     public double getSelectQueryAverageDuration() {
-        return updateAndGetLastSingleMetricValue("select", AVERAGE_DURATION);
+        return metricByCommand.get().getOrDefault(Commands.SELECT, DEFAULT_METRIC).avgDurationInMs();
     }
 
     @Override
     public double getInsertQueryAverageDuration() {
-        return updateAndGetLastSingleMetricValue("insert", AVERAGE_DURATION);
+        return metricByCommand.get().getOrDefault(Commands.INSERT, DEFAULT_METRIC).avgDurationInMs();
     }
 
     @Override
     public double getUpdateQueryAverageDuration() {
-        return updateAndGetLastSingleMetricValue("update", AVERAGE_DURATION);
+        return metricByCommand.get().getOrDefault(Commands.UPDATE, DEFAULT_METRIC).avgDurationInMs();
     }
 
     @Override
     public double getDeleteQueryAverageDuration() {
-        return updateAndGetLastSingleMetricValue("delete", AVERAGE_DURATION);
+        return metricByCommand.get().getOrDefault(Commands.DELETE, DEFAULT_METRIC).avgDurationInMs();
     }
 
     @Override
     public double getOverallQueryFrequency() {
-        return updateAndGetLastOverallMetricValue("select|insert|delete|update", FREQUENCY);
+        return metricByCommand.get().getOrDefault(Commands.TOTAL, DEFAULT_METRIC).statementsPerSec();
     }
 
     @Override
     public double getOverallQueryAverageDuration() {
-        return updateAndGetLastOverallMetricValue("select|insert|delete|update", AVERAGE_DURATION);
-    }
-
-    private double updateAndGetLastOverallMetricValue(String query, MetricType type) {
-        return updateAndLastGetMetricValue(query, type, true);
-    }
-
-    private double updateAndGetLastSingleMetricValue(String query, MetricType type) {
-        return updateAndLastGetMetricValue(query, type, false);
-    }
-
-    private double updateAndLastGetMetricValue(String query, MetricType type, boolean overall) {
-        try {
-            String queryUID = query + type;
-            String queryPattern = String.format(Locale.ENGLISH, QUERY_PATTERN, query);
-            long lastTs = updateAndGetLastExecutedTsFor(queryUID);
-
-            session.bind(UNNAMED, NAME, Arrays.asList(lastTs, queryPattern, lastTs, queryPattern), null);
-            session.execute(UNNAMED, 0, new ResultReceiver() {
-
-                private final CompletableFuture<Boolean> completionFuture = new CompletableFuture<>();
-                private final List<Row> rows = new ArrayList<>();
-
-                @Override
-                public void setNextRow(Row row) {
-                    rows.add(row);
-                }
-
-                @Override
-                public void allFinished(boolean interrupted) {
-                    double value = overall ?
-                        getTotalMetricValue(rows, type.ordinal()) :
-                        getMetricValue(rows, query, type.ordinal());
-                    metrics.put(queryUID, value);
-                    completionFuture.complete(interrupted);
-                }
-
-                @Override
-                public void fail(@Nonnull Throwable t) {
-                    logger.error("Failed to process metric results!", t);
-                    completionFuture.completeExceptionally(t);
-                }
-
-                @Override
-                public CompletableFuture<?> completionFuture() {
-                    return completionFuture;
-                }
-
-                @Override
-                public void batchFinished() {
-                }
-            });
-            session.sync();
-            return metrics.getOrDefault(queryUID, .0);
-        } catch (Throwable t) {
-            throw SQLExceptions.createSQLActionException(t);
-        }
-    }
-
-    @VisibleForTesting
-    double getMetricValue(List<Row> rows, String query, int metricIdx) {
-        return rows.stream()
-            .filter(row -> query.equalsIgnoreCase(BytesRefs.toString(row.get(2))))
-            .mapToDouble(row -> (double) row.get(metricIdx))
-            .findAny().orElse(.0);
-    }
-
-    @VisibleForTesting
-    double getTotalMetricValue(List<Row> rows, int metricIdx) {
-        return rows.stream()
-            .mapToDouble(row -> (double) row.get(metricIdx))
-            .sum();
-    }
-
-    @VisibleForTesting
-    long updateAndGetLastExecutedTsFor(String queryUID) {
-        long currentTs = System.currentTimeMillis();
-        long lastTs = lastQueried.getOrDefault(queryUID, currentTs);
-
-        lastQueried.put(queryUID, currentTs);
-        return lastTs;
+        return metricByCommand.get().getOrDefault(Commands.TOTAL, DEFAULT_METRIC).avgDurationInMs();
     }
 }
